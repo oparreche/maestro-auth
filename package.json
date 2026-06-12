@@ -1,0 +1,19 @@
+{
+  "name": "maestro-auth",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Serviço de autenticação do Maestro (OAuth GitHub/Google + JWT + papéis gestor/dev)",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
