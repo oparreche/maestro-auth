@@ -60,13 +60,18 @@ function loadStore() {
     s = {};
   }
   // garante as chaves (e migra stores antigos sem quebrar)
-  s.users = s.users || {};
+  s.users = s.users || {}; // legado (modelo provider:id) — mantido p/ compat
   s.invites = s.invites || {};
   s.pipelines = s.pipelines || [];
   s.accessRules = s.accessRules || [];
   s.nucleos = s.nucleos || {}; // id -> { id,name,ownerKey,createdAt,projects:[],workspaces:[] }
   s.memberships = s.memberships || {}; // nucleoId -> userKey -> { caps:[],projectIds,invitedBy,joinedAt }
   s.nucleoInvites = s.nucleoInvites || {}; // nucleoId -> [ { token,login?,caps,projectIds,createdBy,createdAt,expiresAt,acceptedBy } ]
+  // conta canônica por e-mail + conexões de provedor (N por provedor)
+  s.accounts = s.accounts || {}; // accId -> { id,primaryEmail,emails{},name,avatar,role,createdAt,lastLogin }
+  s.connections = s.connections || {}; // connId -> { id,accountId,provider,providerUserId,login,name,avatar,email,emailVerified,legacyKey,createdAt,lastUsedAt }
+  s.connByProvider = s.connByProvider || {}; // "github:123" -> connId
+  s.schemaVersion = s.schemaVersion || 1;
   return s;
 }
 function saveStore(s) {
@@ -95,17 +100,73 @@ const NUCLEO_CAPS = [
   'members.manage',
   'projects.manage',
 ];
+function genId(prefix) {
+  return prefix + '_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+}
+
+// ---------- conta canônica + conexões ----------
+// O `principal` (claims.sub) pode ser um accountId (JWT v2) OU um legado
+// "provider:id" (JWT v1, durante a janela de 12h). Resolve p/ o accountId.
+function canonicalAccountId(store, principal) {
+  if (!principal) return null;
+  if (store.accounts[principal]) return principal;
+  const connId = store.connByProvider[principal];
+  if (connId && store.connections[connId]) return store.connections[connId].accountId;
+  return principal; // legado sem conexão mapeada ainda
+}
+// Todas as chaves que representam esta conta (accountId + chaves legadas das
+// conexões). Usado p/ resolução dual-key dos Núcleos (ownerKey/membros antigos).
+function keysFor(store, principal) {
+  const accId = canonicalAccountId(store, principal);
+  const keys = new Set([accId, principal]);
+  for (const c of Object.values(store.connections)) {
+    if (c.accountId === accId) {
+      keys.add(c.legacyKey || c.provider + ':' + c.providerUserId);
+    }
+  }
+  return keys;
+}
+// logins (provider:login) de uma conta — p/ GESTOR_LOGINS/invite-bind.
+function accountLogins(store, accId) {
+  return Object.values(store.connections)
+    .filter((c) => c.accountId === accId)
+    .map((c) => String(c.login || '').toLowerCase())
+    .filter(Boolean);
+}
+function findAccountByVerifiedEmail(store, email) {
+  const e = String(email || '').toLowerCase();
+  if (!e) return null;
+  for (const a of Object.values(store.accounts)) {
+    if (a.emails && a.emails[e] && a.emails[e].verified) return a.id;
+  }
+  return null;
+}
+// papel global da conta: gestor se algum login está no GESTOR_LOGINS; senão
+// mantém o que já tem; senão dev (DEV_LOGINS/convite por login); senão pending.
+function effectiveRole(store, accId, current) {
+  const logins = accountLogins(store, accId);
+  if (logins.some((l) => GESTOR_LOGINS.includes(l))) return 'gestor';
+  if (current && current !== 'pending') return current;
+  if (logins.some((l) => store.invites[l])) return store.invites[logins.find((l) => store.invites[l])];
+  if (logins.some((l) => DEV_LOGINS.includes(l))) return 'dev';
+  return current || 'pending';
+}
+
 // papel do usuário dentro de um núcleo: dono (tudo), membro (whitelist) ou null.
-function nucleoRoleFor(store, nucleoId, userKey) {
+// `principal` = claims.sub (accountId v2 ou provider:id v1). Resolução dual-key.
+function nucleoRoleFor(store, nucleoId, principal) {
   const n = store.nucleos[nucleoId];
   if (!n) return null;
-  if (n.ownerKey === userKey) return { owner: true, caps: NUCLEO_CAPS.slice(), projectIds: null };
-  const m = store.memberships[nucleoId] && store.memberships[nucleoId][userKey];
-  if (!m) return null;
-  return { owner: false, caps: Array.isArray(m.caps) ? m.caps : [], projectIds: m.projectIds || null };
+  const keys = keysFor(store, principal);
+  if (keys.has(n.ownerKey)) return { owner: true, caps: NUCLEO_CAPS.slice(), projectIds: null };
+  const ms = store.memberships[nucleoId] || {};
+  for (const k of keys) {
+    if (ms[k]) return { owner: false, caps: Array.isArray(ms[k].caps) ? ms[k].caps : [], projectIds: ms[k].projectIds || null };
+  }
+  return null;
 }
-function canInNucleo(store, userKey, nucleoId, cap, projectId) {
-  const r = nucleoRoleFor(store, nucleoId, userKey);
+function canInNucleo(store, principal, nucleoId, cap, projectId) {
+  const r = nucleoRoleFor(store, nucleoId, principal);
   if (!r) return false;
   if (r.owner) return true;
   if (!r.caps.includes(cap)) return false;
@@ -113,11 +174,11 @@ function canInNucleo(store, userKey, nucleoId, cap, projectId) {
   return true;
 }
 // resumo dos núcleos que o usuário acessa (dono + membro) p/ o /api/me e a lista.
-function nucleosForUser(store, userKey) {
+function nucleosForUser(store, principal) {
   const out = [];
   for (const id of Object.keys(store.nucleos)) {
     const n = store.nucleos[id];
-    const r = nucleoRoleFor(store, id, userKey);
+    const r = nucleoRoleFor(store, id, principal);
     if (!r) continue;
     out.push({
       id,
@@ -133,25 +194,11 @@ function nucleosForUser(store, userKey) {
   }
   return out;
 }
-function genId(prefix) {
-  return prefix + '_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
-}
 
-// Decide o papel de um usuário que está logando.
-function resolveRole(store, key, login) {
-  const existing = store.users[key];
-  if (existing && existing.role) return existing.role; // já cadastrado: mantém
-  const l = String(login || '').toLowerCase();
-  if (GESTOR_LOGINS.includes(l)) return 'gestor';
-  if (store.invites && store.invites[l]) return store.invites[l]; // convidado por um gestor
-  if (DEV_LOGINS.includes(l)) return 'dev';
-  return 'pending';
-}
-
-// ---------- JWT ----------
-function signToken(user) {
+// ---------- JWT (v2: sub=accountId, logins[], cv:2) ----------
+function signToken(account, store) {
   return jwt.sign(
-    { sub: user.key, login: user.login, name: user.name, role: user.role },
+    { sub: account.id, name: account.name, role: account.role, logins: accountLogins(store, account.id), cv: 2 },
     JWT_SECRET,
     { expiresIn: TOKEN_TTL }
   );
@@ -188,49 +235,113 @@ function isLoopback(url) {
   }
 }
 
-// Finaliza o login: faz upsert do usuário, resolve o papel, assina o JWT e
-// devolve pro app pelo loopback. `profile` é normalizado (qualquer provider).
-function completeLogin(profile, cb, res, providerToken) {
+// upsert de conexão + conta. Em LOGIN (connectAccountId vazio): acha/cria a conta
+// (vínculo por e-mail verificado). Em CONNECT (connectAccountId): anexa à conta atual.
+// Retorna { accountId, connId } ou { error }.
+function upsertConnection(store, profile, connectAccountId) {
+  const NOW = new Date().toISOString();
+  const legacyKey = profile.provider + ':' + profile.id;
+  let connId = store.connByProvider[legacyKey];
+  let accountId;
+  if (connId && store.connections[connId]) {
+    accountId = store.connections[connId].accountId;
+    if (connectAccountId && connectAccountId !== accountId) {
+      return { error: 'Essa conta de ' + profile.provider + ' já está vinculada a outra conta Maestro.' };
+    }
+    Object.assign(store.connections[connId], {
+      login: profile.login, name: profile.name || profile.login, avatar: profile.avatar || null,
+      email: profile.email || null, emailVerified: !!profile.emailVerified, lastUsedAt: NOW,
+    });
+  } else {
+    const verifiedEmail = profile.emailVerified && profile.email ? String(profile.email).toLowerCase() : null;
+    if (connectAccountId) {
+      accountId = connectAccountId; // anexa à conta autenticada
+    } else {
+      accountId = verifiedEmail ? findAccountByVerifiedEmail(store, verifiedEmail) : null;
+      if (!accountId) {
+        accountId = genId('acc');
+        store.accounts[accountId] = {
+          id: accountId, primaryEmail: verifiedEmail || profile.email || null, emails: {},
+          name: profile.name || profile.login, avatar: profile.avatar || null,
+          role: 'pending', createdAt: NOW, lastLogin: NOW,
+        };
+      }
+    }
+    connId = genId('conn');
+    store.connections[connId] = {
+      id: connId, accountId, provider: profile.provider, providerUserId: String(profile.id),
+      login: profile.login, name: profile.name || profile.login, avatar: profile.avatar || null,
+      email: profile.email || null, emailVerified: !!profile.emailVerified, legacyKey, createdAt: NOW, lastUsedAt: NOW,
+    };
+    store.connByProvider[legacyKey] = connId;
+    if (verifiedEmail && store.accounts[accountId]) {
+      store.accounts[accountId].emails[verifiedEmail] = { verified: true, via: connId, addedAt: NOW };
+      if (!store.accounts[accountId].primaryEmail) store.accounts[accountId].primaryEmail = verifiedEmail;
+    }
+  }
+  const acc = store.accounts[accountId];
+  acc.lastLogin = NOW;
+  acc.role = effectiveRole(store, accountId, acc.role);
+  if (!acc.name && profile.name) acc.name = profile.name;
+  if (!acc.avatar && profile.avatar) acc.avatar = profile.avatar;
+  return { accountId, connId };
+}
+
+// Finaliza login/connect: upsert da conexão, assina o JWT (v2) e devolve pro app
+// pelo loopback. `connectAccountId` setado = modo CONNECT (anexa sem trocar conta).
+function completeLogin(profile, cb, res, providerToken, connectAccountId) {
   const store = loadStore();
-  const key = profile.provider + ':' + profile.id;
-  const role = resolveRole(store, key, profile.login);
-  const user = {
-    key,
-    provider: profile.provider,
-    login: profile.login,
-    name: profile.name || profile.login,
-    email: profile.email || null,
-    avatar: profile.avatar || null,
-    role,
-    createdAt: (store.users[key] && store.users[key].createdAt) || new Date().toISOString(),
-    lastLogin: new Date().toISOString(),
-  };
-  store.users[key] = user;
+  const r = upsertConnection(store, profile, connectAccountId);
+  if (r.error) return res.status(409).send(r.error);
   saveStore(store);
-  const token = signToken(user);
+  const acc = store.accounts[r.accountId];
+  const token = signToken(acc, store);
   const sep = cb.includes('#') ? '&' : '#';
   // o provider token NÃO é persistido aqui — só repassado ao app local (loopback),
-  // que o guarda localmente p/ listar os repos do usuário. Cada um tem a sua credencial.
+  // guardado localmente por conexão (cid) p/ listar os repos. Cada um tem sua credencial.
   let frag = 'token=' + encodeURIComponent(token);
   if (providerToken) {
-    frag += '&pt=' + encodeURIComponent(providerToken) + '&pp=' + encodeURIComponent(profile.provider);
+    frag += '&pt=' + encodeURIComponent(providerToken) + '&pp=' + encodeURIComponent(profile.provider) + '&cid=' + encodeURIComponent(r.connId);
   }
   res.redirect(cb + sep + frag);
 }
 
-// Inicia um fluxo OAuth: valida o cb (loopback), guarda o state e redireciona.
-function startOAuth(req, res, authUrl, clientId, scope) {
-  const cb = String(req.query.cb || '');
-  if (!isLoopback(cb)) return res.status(400).send('cb inválido (precisa ser loopback http://127.0.0.1:porta/...)');
+// Monta a URL do provedor; guarda o state com mode (login|connect) + accountId
+// (no servidor, nunca na URL). Sempre usa o callback registrado /auth/<provider>/callback.
+function buildOAuthUrl(provider, authUrl, clientId, scope, cb, mode, accountId) {
   const state = crypto.randomBytes(16).toString('hex');
-  pending.set(state, { cb, exp: Date.now() + 10 * 60 * 1000 });
+  pending.set(state, { cb, exp: Date.now() + 10 * 60 * 1000, mode: mode || 'login', accountId: accountId || null });
   const u = new URL(authUrl);
   u.searchParams.set('client_id', clientId);
-  u.searchParams.set('redirect_uri', PUBLIC_URL + req.path + '/callback');
+  u.searchParams.set('redirect_uri', PUBLIC_URL + '/auth/' + provider + '/callback');
   u.searchParams.set('response_type', 'code');
   u.searchParams.set('scope', scope);
   u.searchParams.set('state', state);
-  res.redirect(u.toString());
+  return u.toString();
+}
+const GH_AUTH = 'https://github.com/login/oauth/authorize';
+const GH_SCOPE = 'read:user user:email repo';
+const BB_AUTH = 'https://bitbucket.org/site/oauth2/authorize';
+const BB_SCOPE = 'account email repository';
+const PROV = { github: { authUrl: GH_AUTH, id: GH_ID, scope: GH_SCOPE }, bitbucket: { authUrl: BB_AUTH, id: BB_ID, scope: BB_SCOPE } };
+// LOGIN: redireciona pro provedor. CONNECT: exige JWT e devolve a URL (o app abre).
+function startLoginRoute(provider) {
+  return (req, res) => {
+    const cb = String(req.query.cb || '');
+    if (!isLoopback(cb)) return res.status(400).send('cb inválido (precisa ser loopback http://127.0.0.1:porta/...)');
+    const c = PROV[provider];
+    res.redirect(buildOAuthUrl(provider, c.authUrl, c.id, c.scope, cb, 'login'));
+  };
+}
+function startConnectRoute(provider) {
+  return (req, res) => {
+    const cb = String(req.query.cb || '');
+    if (!isLoopback(cb)) return res.status(400).json({ error: 'cb inválido' });
+    const store = loadStore();
+    const accountId = canonicalAccountId(store, req.claims.sub);
+    const c = PROV[provider];
+    res.json({ ok: true, url: buildOAuthUrl(provider, c.authUrl, c.id, c.scope, cb, 'connect', accountId) });
+  };
 }
 
 const app = express();
@@ -248,7 +359,9 @@ app.get('/auth/providers', (_req, res) => {
 });
 
 // ---- GitHub ----
-app.get('/auth/github', (req, res) => startOAuth(req, res, 'https://github.com/login/oauth/authorize', GH_ID, 'read:user user:email repo'));
+app.get('/auth/github', startLoginRoute('github'));
+app.get('/auth/github/connect', auth, startConnectRoute('github'));
+app.get('/auth/bitbucket/connect', auth, startConnectRoute('bitbucket'));
 
 app.get('/auth/github/callback', async (req, res) => {
   const { code, state } = req.query;
@@ -267,20 +380,26 @@ app.get('/auth/github/callback', async (req, res) => {
     if (!ghToken) return res.status(400).send('falha ao autenticar no GitHub');
     const h = { Authorization: 'Bearer ' + ghToken, 'User-Agent': 'maestro-auth', Accept: 'application/vnd.github+json' };
     const gh = await (await fetch('https://api.github.com/user', { headers: h })).json();
-    let email = gh.email;
-    if (!email) {
+    // e-mail VERIFICADO (não confiar no e-mail público do perfil p/ vínculo de conta)
+    let email = null;
+    let emailVerified = false;
+    try {
       const emails = await (await fetch('https://api.github.com/user/emails', { headers: h })).json();
-      const primary = Array.isArray(emails) ? emails.find((e) => e.primary) || emails[0] : null;
-      email = primary ? primary.email : null;
-    }
-    completeLogin({ provider: 'github', id: gh.id, login: gh.login, name: gh.name, email, avatar: gh.avatar_url }, p.cb, res, ghToken);
+      if (Array.isArray(emails)) {
+        const pick = emails.find((e) => e.primary && e.verified) || emails.find((e) => e.verified) || emails.find((e) => e.primary) || emails[0];
+        if (pick) { email = pick.email; emailVerified = !!pick.verified; }
+      }
+    } catch {}
+    if (!email) { email = gh.email || null; emailVerified = false; }
+    const connectAccountId = p.mode === 'connect' ? p.accountId : null;
+    completeLogin({ provider: 'github', id: gh.id, login: gh.login, name: gh.name, email, emailVerified, avatar: gh.avatar_url }, p.cb, res, ghToken, connectAccountId);
   } catch (e) {
     res.status(500).send('erro no login: ' + (e && e.message));
   }
 });
 
 // ---- Bitbucket ----
-app.get('/auth/bitbucket', (req, res) => startOAuth(req, res, 'https://bitbucket.org/site/oauth2/authorize', BB_ID, 'account email repository'));
+app.get('/auth/bitbucket', startLoginRoute('bitbucket'));
 
 app.get('/auth/bitbucket/callback', async (req, res) => {
   const { code, state } = req.query;
@@ -301,17 +420,20 @@ app.get('/auth/bitbucket/callback', async (req, res) => {
     const h = { Authorization: 'Bearer ' + bbToken, Accept: 'application/json' };
     const bb = await (await fetch('https://api.bitbucket.org/2.0/user', { headers: h })).json();
     let email = null;
+    let emailVerified = false;
     try {
       const emails = await (await fetch('https://api.bitbucket.org/2.0/user/emails', { headers: h })).json();
       const vals = (emails && emails.values) || [];
-      const primary = vals.find((e) => e.is_primary && e.is_confirmed) || vals.find((e) => e.is_primary) || vals[0];
-      email = primary ? primary.email : null;
+      const pick = vals.find((e) => e.is_primary && e.is_confirmed) || vals.find((e) => e.is_confirmed) || vals.find((e) => e.is_primary) || vals[0];
+      if (pick) { email = pick.email; emailVerified = !!pick.is_confirmed; }
     } catch {}
+    const connectAccountId = p.mode === 'connect' ? p.accountId : null;
     completeLogin(
-      { provider: 'bitbucket', id: bb.uuid || bb.account_id, login: bb.username || bb.nickname, name: bb.display_name, email, avatar: bb.links && bb.links.avatar && bb.links.avatar.href },
+      { provider: 'bitbucket', id: bb.uuid || bb.account_id, login: bb.username || bb.nickname, name: bb.display_name, email, emailVerified, avatar: bb.links && bb.links.avatar && bb.links.avatar.href },
       p.cb,
       res,
-      bbToken
+      bbToken,
+      connectAccountId
     );
   } catch (e) {
     res.status(500).send('erro no login: ' + (e && e.message));
@@ -319,31 +441,77 @@ app.get('/auth/bitbucket/callback', async (req, res) => {
 });
 
 // ---------- API ----------
+// visão de uma conta p/ o app (user p/ compat + account + connections).
+function accountView(store, accId) {
+  const a = store.accounts[accId];
+  if (!a) return null;
+  const conns = Object.values(store.connections)
+    .filter((c) => c.accountId === accId)
+    .map((c) => ({ id: c.id, provider: c.provider, login: c.login, name: c.name, avatar: c.avatar, email: c.email, emailVerified: c.emailVerified }));
+  const primaryLogin = conns[0] ? conns[0].login : a.primaryEmail || accId;
+  return {
+    account: { id: a.id, primaryEmail: a.primaryEmail, name: a.name, avatar: a.avatar, role: a.role, emails: Object.keys(a.emails || {}) },
+    connections: conns,
+    user: { key: a.id, login: primaryLogin, name: a.name || primaryLogin, avatar: a.avatar, role: a.role, provider: conns[0] ? conns[0].provider : null },
+  };
+}
+// nome/login p/ exibir um principal (accountId, legado provider:id, etc.)
+function principalDisplay(store, key) {
+  const accId = canonicalAccountId(store, key);
+  const a = store.accounts[accId];
+  if (a) { const v = accountView(store, accId); return { login: v.user.login, name: a.name || v.user.login, avatar: a.avatar }; }
+  const legacy = store.users[key];
+  if (legacy) return { login: legacy.login, name: legacy.name || legacy.login, avatar: legacy.avatar || null };
+  return { login: key, name: key, avatar: null };
+}
+
 app.get('/api/me', auth, (req, res) => {
   const store = loadStore();
-  const u = store.users[req.claims.sub] || null;
+  const accId = canonicalAccountId(store, req.claims.sub);
+  const v = accountView(store, accId);
   res.json({
     ok: true,
-    user: u,
-    permissions: permissionsFor(req.claims.role),
+    user: v ? v.user : null,
+    account: v ? v.account : null,
+    connections: v ? v.connections : [],
+    permissions: permissionsFor((v && v.user.role) || req.claims.role),
     nucleos: nucleosForUser(store, req.claims.sub),
     nucleoCaps: NUCLEO_CAPS,
   });
 });
 
-// gestão de usuários (gestor)
+// gestão de usuários (gestor) — agora lista CONTAS
 app.get('/api/users', auth, requireGestor, (_req, res) => {
   const store = loadStore();
-  res.json({ ok: true, users: Object.values(store.users) });
+  const users = Object.values(store.accounts).map((a) => {
+    const v = accountView(store, a.id);
+    return { key: a.id, login: v.user.login, name: a.name, role: a.role, email: a.primaryEmail, provider: v.user.provider, logins: accountLogins(store, a.id) };
+  });
+  res.json({ ok: true, users });
 });
 app.post('/api/users/role', auth, requireGestor, (req, res) => {
   const { key, role } = req.body || {};
   if (!['gestor', 'dev', 'pending'].includes(role)) return res.status(400).json({ error: 'papel inválido' });
   const store = loadStore();
-  if (!store.users[key]) return res.status(404).json({ error: 'usuário não encontrado' });
-  store.users[key].role = role;
+  if (!store.accounts[key]) return res.status(404).json({ error: 'conta não encontrada' });
+  store.accounts[key].role = role;
   saveStore(store);
-  res.json({ ok: true, user: store.users[key] });
+  res.json({ ok: true });
+});
+// desconectar uma conexão da minha conta
+app.post('/api/connections/disconnect', auth, (req, res) => {
+  const store = loadStore();
+  const accId = canonicalAccountId(store, req.claims.sub);
+  const connId = String((req.body || {}).connId || '');
+  const c = store.connections[connId];
+  if (!c || c.accountId !== accId) return res.status(404).json({ error: 'conexão não encontrada' });
+  // remove o e-mail do conjunto de auto-vínculo se foi essa conexão que o trouxe
+  const acc = store.accounts[accId];
+  if (acc && acc.emails) for (const e of Object.keys(acc.emails)) if (acc.emails[e].via === connId) delete acc.emails[e];
+  delete store.connByProvider[c.legacyKey || c.provider + ':' + c.providerUserId];
+  delete store.connections[connId];
+  saveStore(store);
+  res.json({ ok: true });
 });
 // pré-cadastra alguém por login do GitHub (antes do 1º acesso)
 app.post('/api/users/invite', auth, requireGestor, (req, res) => {
@@ -369,24 +537,16 @@ function withNucleoCap(req, res, cap, fn) {
 function nucleoDetail(store, id) {
   const n = store.nucleos[id];
   const members = [];
-  const owner = store.users[n.ownerKey];
-  members.push({
-    userKey: n.ownerKey,
-    login: owner ? owner.login : n.ownerKey,
-    name: owner ? owner.name : n.ownerKey,
-    avatar: owner ? owner.avatar : null,
-    role: 'owner',
-    caps: NUCLEO_CAPS.slice(),
-    projectIds: null,
-  });
+  const od = principalDisplay(store, n.ownerKey);
+  members.push({ userKey: n.ownerKey, login: od.login, name: od.name, avatar: od.avatar, role: 'owner', caps: NUCLEO_CAPS.slice(), projectIds: null });
   const ms = store.memberships[id] || {};
   for (const k of Object.keys(ms)) {
-    const u = store.users[k];
+    const d = principalDisplay(store, k);
     members.push({
       userKey: k,
-      login: u ? u.login : (ms[k].login || k),
-      name: u ? u.name : (ms[k].login || k),
-      avatar: u ? u.avatar : null,
+      login: ms[k].login || d.login,
+      name: d.name,
+      avatar: d.avatar,
       role: 'member',
       caps: ms[k].caps || [],
       projectIds: ms[k].projectIds || null,
@@ -406,7 +566,7 @@ app.post('/api/nucleos', auth, (req, res) => {
   if (!name) return res.status(400).json({ error: 'nome ausente' });
   const n = mutate((store) => {
     const id = genId('ncl');
-    const nucleo = { id, name, ownerKey: req.claims.sub, createdAt: new Date().toISOString(), projects: [], workspaces: [] };
+    const nucleo = { id, name, ownerKey: canonicalAccountId(store, req.claims.sub), createdAt: new Date().toISOString(), projects: [], workspaces: [] };
     store.nucleos[id] = nucleo;
     store.memberships[id] = store.memberships[id] || {};
     store.nucleoInvites[id] = store.nucleoInvites[id] || [];
@@ -435,7 +595,7 @@ app.delete('/api/nucleos/:id', auth, (req, res) => {
   const store = loadStore();
   const n = store.nucleos[req.params.id];
   if (!n) return res.status(404).json({ error: 'núcleo não encontrado' });
-  if (n.ownerKey !== req.claims.sub) return res.status(403).json({ error: 'só o dono exclui o núcleo' });
+  if (!keysFor(store, req.claims.sub).has(n.ownerKey)) return res.status(403).json({ error: 'só o dono exclui o núcleo' });
   delete store.nucleos[req.params.id];
   delete store.memberships[req.params.id];
   delete store.nucleoInvites[req.params.id];
@@ -579,22 +739,24 @@ app.post('/api/invites/:token/accept', auth, (req, res) => {
   if (!found) return res.status(404).json({ error: 'convite inválido' });
   if (found.acceptedBy) return res.status(409).json({ error: 'convite já usado' });
   if (found.expiresAt && new Date(found.expiresAt) < new Date()) return res.status(410).json({ error: 'convite expirado' });
-  // login-bind: se o convite foi pra um login específico, exige bater
-  if (found.login && String(req.claims.login || '').toLowerCase() !== found.login) {
+  // login-bind: se o convite foi pra um login específico, exige bater com ALGUM login da conta
+  const myLogins = Array.isArray(req.claims.logins) ? req.claims.logins : req.claims.login ? [String(req.claims.login).toLowerCase()] : accountLogins(store, canonicalAccountId(store, req.claims.sub));
+  if (found.login && !myLogins.includes(found.login)) {
     return res.status(403).json({ error: 'este convite é de outra conta (' + found.login + ')' });
   }
   if (!store.nucleos[nucleoId]) return res.status(404).json({ error: 'núcleo não existe mais' });
-  if (store.nucleos[nucleoId].ownerKey === req.claims.sub) return res.status(400).json({ error: 'você já é o dono deste núcleo' });
+  const me = canonicalAccountId(store, req.claims.sub);
+  if (keysFor(store, req.claims.sub).has(store.nucleos[nucleoId].ownerKey)) return res.status(400).json({ error: 'você já é o dono deste núcleo' });
   store.memberships[nucleoId] = store.memberships[nucleoId] || {};
-  store.memberships[nucleoId][req.claims.sub] = {
-    userKey: req.claims.sub,
-    login: req.claims.login,
+  store.memberships[nucleoId][me] = {
+    userKey: me,
+    login: myLogins[0] || null,
     caps: found.caps || [],
     projectIds: found.projectIds || null,
     invitedBy: found.createdBy,
     joinedAt: new Date().toISOString(),
   };
-  found.acceptedBy = req.claims.sub;
+  found.acceptedBy = me;
   saveStore(store);
   res.json({ ok: true, nucleoId, name: store.nucleos[nucleoId].name });
 });
