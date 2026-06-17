@@ -53,17 +53,88 @@ function permissionsFor(role) {
 // ---------- armazenamento simples (JSON) ----------
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
 function loadStore() {
+  let s;
   try {
-    return JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
+    s = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
   } catch {
-    return { users: {}, pipelines: [], accessRules: [] };
+    s = {};
   }
+  // garante as chaves (e migra stores antigos sem quebrar)
+  s.users = s.users || {};
+  s.invites = s.invites || {};
+  s.pipelines = s.pipelines || [];
+  s.accessRules = s.accessRules || [];
+  s.nucleos = s.nucleos || {}; // id -> { id,name,ownerKey,createdAt,projects:[],workspaces:[] }
+  s.memberships = s.memberships || {}; // nucleoId -> userKey -> { caps:[],projectIds,invitedBy,joinedAt }
+  s.nucleoInvites = s.nucleoInvites || {}; // nucleoId -> [ { token,login?,caps,projectIds,createdBy,createdAt,expiresAt,acceptedBy } ]
+  return s;
 }
 function saveStore(s) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const tmp = STORE_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
   fs.renameSync(tmp, STORE_FILE);
+}
+// transação atômica: como os handlers de núcleo são síncronos do load ao save
+// (sem await no meio), o Node garante exclusão mútua entre requisições.
+function mutate(fn) {
+  const store = loadStore();
+  const r = fn(store);
+  saveStore(store);
+  return r;
+}
+
+// ---------- Núcleos (times) — permissões por núcleo ----------
+const NUCLEO_CAPS = [
+  'sessions.view',
+  'sessions.resume',
+  'code.view',
+  'mcp.manage',
+  'automations.manage',
+  'deploy',
+  'members.manage',
+  'projects.manage',
+];
+// papel do usuário dentro de um núcleo: dono (tudo), membro (whitelist) ou null.
+function nucleoRoleFor(store, nucleoId, userKey) {
+  const n = store.nucleos[nucleoId];
+  if (!n) return null;
+  if (n.ownerKey === userKey) return { owner: true, caps: NUCLEO_CAPS.slice(), projectIds: null };
+  const m = store.memberships[nucleoId] && store.memberships[nucleoId][userKey];
+  if (!m) return null;
+  return { owner: false, caps: Array.isArray(m.caps) ? m.caps : [], projectIds: m.projectIds || null };
+}
+function canInNucleo(store, userKey, nucleoId, cap, projectId) {
+  const r = nucleoRoleFor(store, nucleoId, userKey);
+  if (!r) return false;
+  if (r.owner) return true;
+  if (!r.caps.includes(cap)) return false;
+  if (projectId && r.projectIds && !r.projectIds.includes(projectId)) return false;
+  return true;
+}
+// resumo dos núcleos que o usuário acessa (dono + membro) p/ o /api/me e a lista.
+function nucleosForUser(store, userKey) {
+  const out = [];
+  for (const id of Object.keys(store.nucleos)) {
+    const n = store.nucleos[id];
+    const r = nucleoRoleFor(store, id, userKey);
+    if (!r) continue;
+    out.push({
+      id,
+      name: n.name,
+      owner: r.owner,
+      caps: r.caps,
+      projectIds: r.projectIds,
+      ownerKey: n.ownerKey,
+      projectCount: (n.projects || []).length,
+      workspaceCount: (n.workspaces || []).length,
+      memberCount: 1 + Object.keys(store.memberships[id] || {}).length,
+    });
+  }
+  return out;
+}
+function genId(prefix) {
+  return prefix + '_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
 }
 
 // Decide o papel de um usuário que está logando.
@@ -119,7 +190,7 @@ function isLoopback(url) {
 
 // Finaliza o login: faz upsert do usuário, resolve o papel, assina o JWT e
 // devolve pro app pelo loopback. `profile` é normalizado (qualquer provider).
-function completeLogin(profile, cb, res) {
+function completeLogin(profile, cb, res, providerToken) {
   const store = loadStore();
   const key = profile.provider + ':' + profile.id;
   const role = resolveRole(store, key, profile.login);
@@ -138,7 +209,13 @@ function completeLogin(profile, cb, res) {
   saveStore(store);
   const token = signToken(user);
   const sep = cb.includes('#') ? '&' : '#';
-  res.redirect(cb + sep + 'token=' + encodeURIComponent(token));
+  // o provider token NÃO é persistido aqui — só repassado ao app local (loopback),
+  // que o guarda localmente p/ listar os repos do usuário. Cada um tem a sua credencial.
+  let frag = 'token=' + encodeURIComponent(token);
+  if (providerToken) {
+    frag += '&pt=' + encodeURIComponent(providerToken) + '&pp=' + encodeURIComponent(profile.provider);
+  }
+  res.redirect(cb + sep + frag);
 }
 
 // Inicia um fluxo OAuth: valida o cb (loopback), guarda o state e redireciona.
@@ -171,7 +248,7 @@ app.get('/auth/providers', (_req, res) => {
 });
 
 // ---- GitHub ----
-app.get('/auth/github', (req, res) => startOAuth(req, res, 'https://github.com/login/oauth/authorize', GH_ID, 'read:user user:email'));
+app.get('/auth/github', (req, res) => startOAuth(req, res, 'https://github.com/login/oauth/authorize', GH_ID, 'read:user user:email repo'));
 
 app.get('/auth/github/callback', async (req, res) => {
   const { code, state } = req.query;
@@ -196,14 +273,14 @@ app.get('/auth/github/callback', async (req, res) => {
       const primary = Array.isArray(emails) ? emails.find((e) => e.primary) || emails[0] : null;
       email = primary ? primary.email : null;
     }
-    completeLogin({ provider: 'github', id: gh.id, login: gh.login, name: gh.name, email, avatar: gh.avatar_url }, p.cb, res);
+    completeLogin({ provider: 'github', id: gh.id, login: gh.login, name: gh.name, email, avatar: gh.avatar_url }, p.cb, res, ghToken);
   } catch (e) {
     res.status(500).send('erro no login: ' + (e && e.message));
   }
 });
 
 // ---- Bitbucket ----
-app.get('/auth/bitbucket', (req, res) => startOAuth(req, res, 'https://bitbucket.org/site/oauth2/authorize', BB_ID, 'account email'));
+app.get('/auth/bitbucket', (req, res) => startOAuth(req, res, 'https://bitbucket.org/site/oauth2/authorize', BB_ID, 'account email repository'));
 
 app.get('/auth/bitbucket/callback', async (req, res) => {
   const { code, state } = req.query;
@@ -233,7 +310,8 @@ app.get('/auth/bitbucket/callback', async (req, res) => {
     completeLogin(
       { provider: 'bitbucket', id: bb.uuid || bb.account_id, login: bb.username || bb.nickname, name: bb.display_name, email, avatar: bb.links && bb.links.avatar && bb.links.avatar.href },
       p.cb,
-      res
+      res,
+      bbToken
     );
   } catch (e) {
     res.status(500).send('erro no login: ' + (e && e.message));
@@ -244,7 +322,13 @@ app.get('/auth/bitbucket/callback', async (req, res) => {
 app.get('/api/me', auth, (req, res) => {
   const store = loadStore();
   const u = store.users[req.claims.sub] || null;
-  res.json({ ok: true, user: u, permissions: permissionsFor(req.claims.role) });
+  res.json({
+    ok: true,
+    user: u,
+    permissions: permissionsFor(req.claims.role),
+    nucleos: nucleosForUser(store, req.claims.sub),
+    nucleoCaps: NUCLEO_CAPS,
+  });
 });
 
 // gestão de usuários (gestor)
@@ -271,6 +355,248 @@ app.post('/api/users/invite', auth, requireGestor, (req, res) => {
   store.invites[login] = role; // aplicado no próximo login desse usuário
   saveStore(store);
   res.json({ ok: true, invites: store.invites });
+});
+
+// ---------- Núcleos (times) ----------
+// helper: carrega o store, exige o núcleo existir e a capacidade; senão responde erro.
+function withNucleoCap(req, res, cap, fn) {
+  const store = loadStore();
+  const id = req.params.id;
+  if (!store.nucleos[id]) return res.status(404).json({ error: 'núcleo não encontrado' });
+  if (!canInNucleo(store, req.claims.sub, id, cap)) return res.status(403).json({ error: 'sem permissão neste núcleo' });
+  return fn(store, store.nucleos[id]);
+}
+function nucleoDetail(store, id) {
+  const n = store.nucleos[id];
+  const members = [];
+  const owner = store.users[n.ownerKey];
+  members.push({
+    userKey: n.ownerKey,
+    login: owner ? owner.login : n.ownerKey,
+    name: owner ? owner.name : n.ownerKey,
+    avatar: owner ? owner.avatar : null,
+    role: 'owner',
+    caps: NUCLEO_CAPS.slice(),
+    projectIds: null,
+  });
+  const ms = store.memberships[id] || {};
+  for (const k of Object.keys(ms)) {
+    const u = store.users[k];
+    members.push({
+      userKey: k,
+      login: u ? u.login : (ms[k].login || k),
+      name: u ? u.name : (ms[k].login || k),
+      avatar: u ? u.avatar : null,
+      role: 'member',
+      caps: ms[k].caps || [],
+      projectIds: ms[k].projectIds || null,
+      invitedBy: ms[k].invitedBy || null,
+    });
+  }
+  return { ...n, members };
+}
+
+// listar meus núcleos (dono + membro)
+app.get('/api/nucleos', auth, (req, res) => {
+  res.json({ ok: true, nucleos: nucleosForUser(loadStore(), req.claims.sub), caps: NUCLEO_CAPS });
+});
+// criar núcleo (qualquer logado vira dono)
+app.post('/api/nucleos', auth, (req, res) => {
+  const name = String((req.body || {}).name || '').trim().slice(0, 80);
+  if (!name) return res.status(400).json({ error: 'nome ausente' });
+  const n = mutate((store) => {
+    const id = genId('ncl');
+    const nucleo = { id, name, ownerKey: req.claims.sub, createdAt: new Date().toISOString(), projects: [], workspaces: [] };
+    store.nucleos[id] = nucleo;
+    store.memberships[id] = store.memberships[id] || {};
+    store.nucleoInvites[id] = store.nucleoInvites[id] || [];
+    return nucleo;
+  });
+  res.json({ ok: true, nucleo: n });
+});
+// detalhe (membro ou dono)
+app.get('/api/nucleos/:id', auth, (req, res) => {
+  const store = loadStore();
+  if (!store.nucleos[req.params.id]) return res.status(404).json({ error: 'núcleo não encontrado' });
+  if (!nucleoRoleFor(store, req.params.id, req.claims.sub)) return res.status(403).json({ error: 'sem acesso a este núcleo' });
+  res.json({ ok: true, nucleo: nucleoDetail(store, req.params.id), me: nucleoRoleFor(store, req.params.id, req.claims.sub) });
+});
+// renomear (projects.manage)
+app.patch('/api/nucleos/:id', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    const name = String((req.body || {}).name || '').trim().slice(0, 80);
+    if (name) n.name = name;
+    saveStore(store);
+    res.json({ ok: true, nucleo: n });
+  });
+});
+// excluir (só dono)
+app.delete('/api/nucleos/:id', auth, (req, res) => {
+  const store = loadStore();
+  const n = store.nucleos[req.params.id];
+  if (!n) return res.status(404).json({ error: 'núcleo não encontrado' });
+  if (n.ownerKey !== req.claims.sub) return res.status(403).json({ error: 'só o dono exclui o núcleo' });
+  delete store.nucleos[req.params.id];
+  delete store.memberships[req.params.id];
+  delete store.nucleoInvites[req.params.id];
+  saveStore(store);
+  res.json({ ok: true });
+});
+
+// ---- projetos do núcleo ----
+app.post('/api/nucleos/:id/projects', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    const b = req.body || {};
+    if (!b.fullName || !b.provider) return res.status(400).json({ error: 'projeto inválido (fullName/provider)' });
+    if ((n.projects || []).some((p) => p.provider === b.provider && p.fullName === b.fullName)) {
+      return res.status(409).json({ error: 'projeto já está no núcleo' });
+    }
+    const prj = {
+      id: genId('prj'),
+      provider: String(b.provider),
+      remoteId: b.remoteId != null ? String(b.remoteId) : '',
+      fullName: String(b.fullName),
+      cloneUrl: String(b.cloneUrl || ''),
+      defaultBranch: String(b.defaultBranch || 'main'),
+      addedBy: req.claims.sub,
+      addedAt: new Date().toISOString(),
+    };
+    n.projects = n.projects || [];
+    n.projects.push(prj);
+    saveStore(store);
+    res.json({ ok: true, project: prj });
+  });
+});
+app.delete('/api/nucleos/:id/projects/:prjId', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    n.projects = (n.projects || []).filter((p) => p.id !== req.params.prjId);
+    // tira o projeto de qualquer workspace que o referencie
+    n.workspaces = (n.workspaces || []).map((w) => ({ ...w, projectIds: (w.projectIds || []).filter((x) => x !== req.params.prjId) }));
+    saveStore(store);
+    res.json({ ok: true });
+  });
+});
+
+// ---- workspaces do núcleo (metadado) ----
+app.post('/api/nucleos/:id/workspaces', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    const name = String((req.body || {}).name || '').trim().slice(0, 80);
+    if (!name) return res.status(400).json({ error: 'nome ausente' });
+    const ws = { id: genId('wsp'), name, projectIds: Array.isArray((req.body || {}).projectIds) ? req.body.projectIds : [], createdAt: new Date().toISOString() };
+    n.workspaces = n.workspaces || [];
+    n.workspaces.push(ws);
+    saveStore(store);
+    res.json({ ok: true, workspace: ws });
+  });
+});
+app.delete('/api/nucleos/:id/workspaces/:wsId', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    n.workspaces = (n.workspaces || []).filter((w) => w.id !== req.params.wsId);
+    saveStore(store);
+    res.json({ ok: true });
+  });
+});
+
+// ---- membros ----
+app.get('/api/nucleos/:id/members', auth, (req, res) => {
+  const store = loadStore();
+  if (!store.nucleos[req.params.id]) return res.status(404).json({ error: 'núcleo não encontrado' });
+  if (!nucleoRoleFor(store, req.params.id, req.claims.sub)) return res.status(403).json({ error: 'sem acesso' });
+  res.json({ ok: true, members: nucleoDetail(store, req.params.id).members });
+});
+app.patch('/api/nucleos/:id/members/:userKey', auth, (req, res) => {
+  withNucleoCap(req, res, 'members.manage', (store, n) => {
+    const k = req.params.userKey;
+    if (k === n.ownerKey) return res.status(400).json({ error: 'o dono tem todas as permissões' });
+    const ms = (store.memberships[req.params.id] = store.memberships[req.params.id] || {});
+    if (!ms[k]) return res.status(404).json({ error: 'membro não encontrado' });
+    const b = req.body || {};
+    if (Array.isArray(b.caps)) ms[k].caps = b.caps.filter((c) => NUCLEO_CAPS.includes(c));
+    if ('projectIds' in b) ms[k].projectIds = Array.isArray(b.projectIds) ? b.projectIds : null;
+    saveStore(store);
+    res.json({ ok: true });
+  });
+});
+app.delete('/api/nucleos/:id/members/:userKey', auth, (req, res) => {
+  withNucleoCap(req, res, 'members.manage', (store, n) => {
+    const k = req.params.userKey;
+    if (k === n.ownerKey) return res.status(400).json({ error: 'não dá p/ remover o dono' });
+    const ms = store.memberships[req.params.id] || {};
+    delete ms[k];
+    saveStore(store);
+    res.json({ ok: true });
+  });
+});
+
+// ---- convites ----
+app.post('/api/nucleos/:id/invites', auth, (req, res) => {
+  withNucleoCap(req, res, 'members.manage', (store, n) => {
+    const b = req.body || {};
+    const caps = Array.isArray(b.caps) ? b.caps.filter((c) => NUCLEO_CAPS.includes(c)) : ['sessions.view'];
+    const invite = {
+      token: genId('inv'),
+      login: b.login ? String(b.login).trim().toLowerCase() : null,
+      provider: b.provider ? String(b.provider) : null,
+      caps,
+      projectIds: Array.isArray(b.projectIds) ? b.projectIds : null,
+      createdBy: req.claims.sub,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
+      acceptedBy: null,
+    };
+    store.nucleoInvites[req.params.id] = store.nucleoInvites[req.params.id] || [];
+    store.nucleoInvites[req.params.id].push(invite);
+    saveStore(store);
+    res.json({ ok: true, invite });
+  });
+});
+app.get('/api/nucleos/:id/invites', auth, (req, res) => {
+  withNucleoCap(req, res, 'members.manage', (store) => {
+    const list = (store.nucleoInvites[req.params.id] || []).filter((i) => !i.acceptedBy);
+    res.json({ ok: true, invites: list });
+  });
+});
+app.delete('/api/nucleos/:id/invites/:token', auth, (req, res) => {
+  withNucleoCap(req, res, 'members.manage', (store) => {
+    store.nucleoInvites[req.params.id] = (store.nucleoInvites[req.params.id] || []).filter((i) => i.token !== req.params.token);
+    saveStore(store);
+    res.json({ ok: true });
+  });
+});
+// aceitar convite (qualquer logado) — o token é a autorização
+app.post('/api/invites/:token/accept', auth, (req, res) => {
+  const store = loadStore();
+  let found = null;
+  let nucleoId = null;
+  for (const id of Object.keys(store.nucleoInvites)) {
+    const inv = (store.nucleoInvites[id] || []).find((i) => i.token === req.params.token);
+    if (inv) {
+      found = inv;
+      nucleoId = id;
+      break;
+    }
+  }
+  if (!found) return res.status(404).json({ error: 'convite inválido' });
+  if (found.acceptedBy) return res.status(409).json({ error: 'convite já usado' });
+  if (found.expiresAt && new Date(found.expiresAt) < new Date()) return res.status(410).json({ error: 'convite expirado' });
+  // login-bind: se o convite foi pra um login específico, exige bater
+  if (found.login && String(req.claims.login || '').toLowerCase() !== found.login) {
+    return res.status(403).json({ error: 'este convite é de outra conta (' + found.login + ')' });
+  }
+  if (!store.nucleos[nucleoId]) return res.status(404).json({ error: 'núcleo não existe mais' });
+  if (store.nucleos[nucleoId].ownerKey === req.claims.sub) return res.status(400).json({ error: 'você já é o dono deste núcleo' });
+  store.memberships[nucleoId] = store.memberships[nucleoId] || {};
+  store.memberships[nucleoId][req.claims.sub] = {
+    userKey: req.claims.sub,
+    login: req.claims.login,
+    caps: found.caps || [],
+    projectIds: found.projectIds || null,
+    invitedBy: found.createdBy,
+    joinedAt: new Date().toISOString(),
+  };
+  found.acceptedBy = req.claims.sub;
+  saveStore(store);
+  res.json({ ok: true, nucleoId, name: store.nucleos[nucleoId].name });
 });
 
 // pipelines (gestor) — CRUD simples
