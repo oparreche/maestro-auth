@@ -636,6 +636,16 @@ app.delete('/api/nucleos/:id/projects/:prjId', auth, (req, res) => {
     res.json({ ok: true });
   });
 });
+// conexão de provedor a usar p/ ESTE projeto (override do workspace)
+app.patch('/api/nucleos/:id/projects/:prjId', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    const pr = (n.projects || []).find((p) => p.id === req.params.prjId);
+    if (!pr) return res.status(404).json({ error: 'projeto não encontrado' });
+    if ('connectionId' in (req.body || {})) pr.connectionId = req.body.connectionId || null;
+    saveStore(store);
+    res.json({ ok: true });
+  });
+});
 
 // ---- workspaces do núcleo (metadado) ----
 app.post('/api/nucleos/:id/workspaces', auth, (req, res) => {
@@ -647,6 +657,18 @@ app.post('/api/nucleos/:id/workspaces', auth, (req, res) => {
     n.workspaces.push(ws);
     saveStore(store);
     res.json({ ok: true, workspace: ws });
+  });
+});
+app.patch('/api/nucleos/:id/workspaces/:wsId', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    const ws = (n.workspaces || []).find((w) => w.id === req.params.wsId);
+    if (!ws) return res.status(404).json({ error: 'workspace não encontrado' });
+    const b = req.body || {};
+    if ('connectionId' in b) ws.connectionId = b.connectionId || null;
+    if ('name' in b) { const nm = String(b.name || '').trim().slice(0, 80); if (nm) ws.name = nm; }
+    if (Array.isArray(b.projectIds)) ws.projectIds = b.projectIds;
+    saveStore(store);
+    res.json({ ok: true });
   });
 });
 app.delete('/api/nucleos/:id/workspaces/:wsId', auth, (req, res) => {
