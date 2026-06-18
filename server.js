@@ -866,6 +866,95 @@ app.post('/api/inbox/:itemId/claim', auth, (req, res) => {
   res.json({ ok: true, item });
 });
 
+// ---- Kanban de tarefas do Núcleo (servidor) ----
+const BOARD_COLS = [
+  { id: 'todo', name: 'A fazer', color: '#8a857a' },
+  { id: 'doing', name: 'Desenvolvendo', color: '#6ea8fe' },
+  { id: 'review', name: 'Relatórios', color: '#d6a13a' },
+  { id: 'done', name: 'Avaliações', color: '#5bb3a0' },
+];
+function ensureBoard(n) {
+  if (!n.board) n.board = { columns: BOARD_COLS.map((c) => ({ ...c })), cards: [] };
+  if (!Array.isArray(n.board.columns) || !n.board.columns.length) n.board.columns = BOARD_COLS.map((c) => ({ ...c }));
+  if (!Array.isArray(n.board.cards)) n.board.cards = [];
+  return n.board;
+}
+app.get('/api/nucleos/:id/board', auth, (req, res) => {
+  const store = loadStore();
+  const id = req.params.id;
+  if (!store.nucleos[id]) return res.status(404).json({ error: 'núcleo não encontrado' });
+  if (!nucleoRoleFor(store, id, req.claims.sub)) return res.status(403).json({ error: 'sem acesso' });
+  const board = ensureBoard(store.nucleos[id]);
+  saveStore(store);
+  res.json({ ok: true, board });
+});
+app.post('/api/nucleos/:id/board/cards', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    const board = ensureBoard(n);
+    const b = req.body || {};
+    const card = {
+      id: genId('card'),
+      title: String(b.title || '').slice(0, 200) || '(tarefa)',
+      spec: String(b.spec || '').slice(0, 8000),
+      projectId: b.projectId || null,
+      branch: b.branch ? String(b.branch).slice(0, 120) : null,
+      sessionId: b.sessionId || null,
+      columnId: b.columnId || (board.columns[0] && board.columns[0].id),
+      assignee: b.assignee || null,
+      createdBy: canonicalAccountId(store, req.claims.sub),
+      createdAt: new Date().toISOString(),
+    };
+    board.cards.push(card);
+    saveStore(store);
+    res.json({ ok: true, card });
+  });
+});
+app.patch('/api/nucleos/:id/board/cards/:cardId', auth, (req, res) => {
+  const store = loadStore();
+  const id = req.params.id;
+  if (!store.nucleos[id]) return res.status(404).json({ error: 'núcleo não encontrado' });
+  if (!nucleoRoleFor(store, id, req.claims.sub)) return res.status(403).json({ error: 'sem acesso' });
+  const board = ensureBoard(store.nucleos[id]);
+  const card = board.cards.find((c) => c.id === req.params.cardId);
+  if (!card) return res.status(404).json({ error: 'card não encontrado' });
+  const b = req.body || {};
+  for (const k of ['title', 'spec', 'projectId', 'branch', 'sessionId', 'columnId', 'assignee']) {
+    if (k in b) card[k] = b[k];
+  }
+  saveStore(store);
+  res.json({ ok: true });
+});
+app.delete('/api/nucleos/:id/board/cards/:cardId', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    const board = ensureBoard(n);
+    board.cards = board.cards.filter((c) => c.id !== req.params.cardId);
+    saveStore(store);
+    res.json({ ok: true });
+  });
+});
+app.post('/api/nucleos/:id/board/columns', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    const board = ensureBoard(n);
+    const name = String((req.body || {}).name || '').trim().slice(0, 40);
+    if (!name) return res.status(400).json({ error: 'nome ausente' });
+    const col = { id: genId('col'), name, color: (req.body || {}).color || '#8a857a' };
+    board.columns.push(col);
+    saveStore(store);
+    res.json({ ok: true, column: col });
+  });
+});
+app.delete('/api/nucleos/:id/board/columns/:colId', auth, (req, res) => {
+  withNucleoCap(req, res, 'projects.manage', (store, n) => {
+    const board = ensureBoard(n);
+    board.columns = board.columns.filter((c) => c.id !== req.params.colId);
+    // cards órfãos vão pra primeira coluna
+    const first = board.columns[0] && board.columns[0].id;
+    for (const c of board.cards) if (c.columnId === req.params.colId) c.columnId = first;
+    saveStore(store);
+    res.json({ ok: true });
+  });
+});
+
 // pipelines (gestor) — CRUD simples
 app.get('/api/pipelines', auth, (req, res) => {
   res.json({ ok: true, pipelines: loadStore().pipelines || [] });
