@@ -71,6 +71,7 @@ function loadStore() {
   s.accounts = s.accounts || {}; // accId -> { id,primaryEmail,emails{},name,avatar,role,createdAt,lastLogin }
   s.connections = s.connections || {}; // connId -> { id,accountId,provider,providerUserId,login,name,avatar,email,emailVerified,legacyKey,createdAt,lastUsedAt }
   s.connByProvider = s.connByProvider || {}; // "github:123" -> connId
+  s.inbox = s.inbox || {}; // accountId -> [ {id,from,fromName,nucleoId,sessionId,title,projectId,branch,mode,blob?,createdAt} ]
   s.schemaVersion = s.schemaVersion || 1;
   return s;
 }
@@ -781,6 +782,86 @@ app.post('/api/invites/:token/accept', auth, (req, res) => {
   found.acceptedBy = me;
   saveStore(store);
   res.json({ ok: true, nucleoId, name: store.nucleos[nucleoId].name });
+});
+
+// ---- sessões do time (apenas METADADOS; o conteúdo .jsonl nunca passa aqui no publish) ----
+app.post('/api/nucleos/:id/sessions', auth, (req, res) => {
+  const store = loadStore();
+  const id = req.params.id;
+  if (!store.nucleos[id]) return res.status(404).json({ error: 'núcleo não encontrado' });
+  if (!nucleoRoleFor(store, id, req.claims.sub)) return res.status(403).json({ error: 'sem acesso' });
+  const acc = canonicalAccountId(store, req.claims.sub);
+  const n = store.nucleos[id];
+  n.sessionMeta = n.sessionMeta || {};
+  const arr = Array.isArray((req.body || {}).sessions) ? req.body.sessions : [];
+  n.sessionMeta[acc] = arr.slice(0, 500).map((s) => ({
+    sessionId: String(s.sessionId || ''),
+    projectId: s.projectId || null,
+    branch: s.branch ? String(s.branch).slice(0, 120) : null,
+    title: String(s.title || '').slice(0, 200),
+    status: s.status ? String(s.status).slice(0, 20) : null,
+    lastTs: s.lastTs || null,
+  })).filter((s) => s.sessionId);
+  saveStore(store);
+  res.json({ ok: true });
+});
+app.get('/api/nucleos/:id/sessions', auth, (req, res) => {
+  const store = loadStore();
+  const id = req.params.id;
+  if (!store.nucleos[id]) return res.status(404).json({ error: 'núcleo não encontrado' });
+  if (!nucleoRoleFor(store, id, req.claims.sub)) return res.status(403).json({ error: 'sem acesso' });
+  const meta = store.nucleos[id].sessionMeta || {};
+  const me = canonicalAccountId(store, req.claims.sub);
+  const members = Object.keys(meta).map((acc) => {
+    const d = principalDisplay(store, acc);
+    return { accountId: acc, login: d.login, name: d.name, avatar: d.avatar, isMe: acc === me, sessions: meta[acc] || [] };
+  });
+  res.json({ ok: true, members });
+});
+// enviar uma sessão p/ outro membro (modo meta = só ref; full = .jsonl em base64)
+app.post('/api/nucleos/:id/sessions/send', auth, (req, res) => {
+  const store = loadStore();
+  const id = req.params.id;
+  if (!store.nucleos[id] || !nucleoRoleFor(store, id, req.claims.sub)) return res.status(403).json({ error: 'sem acesso' });
+  const b = req.body || {};
+  const toAcc = canonicalAccountId(store, b.toUserKey);
+  if (!store.accounts[toAcc]) return res.status(404).json({ error: 'destinatário não encontrado' });
+  const mode = b.mode === 'full' ? 'full' : 'meta';
+  const blob = mode === 'full' ? String(b.blob || '') : null;
+  if (blob && blob.length > 8 * 1024 * 1024) return res.status(413).json({ error: 'sessão grande demais p/ enviar completa' });
+  const from = canonicalAccountId(store, req.claims.sub);
+  const fd = principalDisplay(store, from);
+  store.inbox[toAcc] = store.inbox[toAcc] || [];
+  store.inbox[toAcc].push({
+    id: genId('shr'), from, fromName: fd.login, nucleoId: id,
+    sessionId: String(b.sessionId || ''), title: String(b.title || '').slice(0, 200),
+    projectId: b.projectId || null, branch: b.branch || null, mode, blob,
+    createdAt: new Date().toISOString(),
+  });
+  saveStore(store);
+  res.json({ ok: true });
+});
+// minha caixa de entrada (sem os blobs — só metadados + hasBlob)
+app.get('/api/inbox', auth, (req, res) => {
+  const store = loadStore();
+  const acc = canonicalAccountId(store, req.claims.sub);
+  const items = (store.inbox[acc] || []).map((i) => ({
+    id: i.id, fromName: i.fromName, nucleoId: i.nucleoId, sessionId: i.sessionId,
+    title: i.title, projectId: i.projectId, branch: i.branch, mode: i.mode, hasBlob: !!i.blob, createdAt: i.createdAt,
+  }));
+  res.json({ ok: true, items });
+});
+// reivindica (e remove) um item — devolve o blob se houver
+app.post('/api/inbox/:itemId/claim', auth, (req, res) => {
+  const store = loadStore();
+  const acc = canonicalAccountId(store, req.claims.sub);
+  const arr = store.inbox[acc] || [];
+  const idx = arr.findIndex((i) => i.id === req.params.itemId);
+  if (idx < 0) return res.status(404).json({ error: 'item não encontrado' });
+  const item = arr[idx];
+  arr.splice(idx, 1);
+  saveStore(store);
+  res.json({ ok: true, item });
 });
 
 // pipelines (gestor) — CRUD simples
