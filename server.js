@@ -642,7 +642,9 @@ app.patch('/api/nucleos/:id/projects/:prjId', auth, (req, res) => {
   withNucleoCap(req, res, 'projects.manage', (store, n) => {
     const pr = (n.projects || []).find((p) => p.id === req.params.prjId);
     if (!pr) return res.status(404).json({ error: 'projeto não encontrado' });
-    if ('connectionId' in (req.body || {})) pr.connectionId = req.body.connectionId || null;
+    const b = req.body || {};
+    if ('connectionId' in b) pr.connectionId = b.connectionId || null;
+    if ('systemPrompt' in b) pr.systemPrompt = String(b.systemPrompt || '').slice(0, 8000) || null;
     saveStore(store);
     res.json({ ok: true });
   });
