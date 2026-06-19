@@ -323,7 +323,7 @@ function buildOAuthUrl(provider, authUrl, clientId, scope, cb, mode, accountId) 
 const GH_AUTH = 'https://github.com/login/oauth/authorize';
 const GH_SCOPE = 'read:user user:email repo';
 const BB_AUTH = 'https://bitbucket.org/site/oauth2/authorize';
-const BB_SCOPE = 'account email repository';
+const BB_SCOPE = 'account email repository pullrequest:write';
 const PROV = { github: { authUrl: GH_AUTH, id: GH_ID, scope: GH_SCOPE }, bitbucket: { authUrl: BB_AUTH, id: BB_ID, scope: BB_SCOPE } };
 // LOGIN: redireciona pro provedor. CONNECT: exige JWT e devolve a URL (o app abre).
 function startLoginRoute(provider) {
