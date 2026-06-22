@@ -867,7 +867,9 @@ app.post('/api/inbox/:itemId/claim', auth, (req, res) => {
 });
 
 // ---- Kanban de tarefas do Núcleo (servidor) ----
+const SCHED_COL = { id: 'scheduled', name: '⏰ Agendadas', color: '#9b8cff' };
 const BOARD_COLS = [
+  SCHED_COL,
   { id: 'todo', name: 'A fazer', color: '#8a857a' },
   { id: 'doing', name: 'Desenvolvendo', color: '#6ea8fe' },
   { id: 'review', name: 'Relatórios', color: '#d6a13a' },
@@ -877,7 +879,22 @@ function ensureBoard(n) {
   if (!n.board) n.board = { columns: BOARD_COLS.map((c) => ({ ...c })), cards: [] };
   if (!Array.isArray(n.board.columns) || !n.board.columns.length) n.board.columns = BOARD_COLS.map((c) => ({ ...c }));
   if (!Array.isArray(n.board.cards)) n.board.cards = [];
+  // migração: garante a coluna Agendadas em boards antigos
+  if (!n.board.columns.some((c) => c.id === 'scheduled')) n.board.columns.unshift({ ...SCHED_COL });
   return n.board;
+}
+// próxima ocorrência a partir de `iso`, somando `every` x `unit` (pulando as já vencidas)
+function nextOccurrence(iso, every, unit) {
+  let d = new Date(iso || Date.now());
+  const now = Date.now();
+  const step = () => {
+    if (unit === 'day') d.setDate(d.getDate() + every);
+    else if (unit === 'week') d.setDate(d.getDate() + every * 7);
+    else d.setMonth(d.getMonth() + every);
+  };
+  let guard = 0;
+  do { step(); } while (d.getTime() <= now && ++guard < 240);
+  return d.toISOString();
 }
 app.get('/api/nucleos/:id/board', auth, (req, res) => {
   const store = loadStore();
@@ -901,6 +918,7 @@ app.post('/api/nucleos/:id/board/cards', auth, (req, res) => {
       sessionId: b.sessionId || null,
       columnId: b.columnId || (board.columns[0] && board.columns[0].id),
       assignee: b.assignee || null,
+      schedule: b.schedule || null, // { next: ISO, every: N (0=uma vez), unit: 'day'|'week'|'month' }
       createdBy: canonicalAccountId(store, req.claims.sub),
       createdAt: new Date().toISOString(),
     };
@@ -918,7 +936,7 @@ app.patch('/api/nucleos/:id/board/cards/:cardId', auth, (req, res) => {
   const card = board.cards.find((c) => c.id === req.params.cardId);
   if (!card) return res.status(404).json({ error: 'card não encontrado' });
   const b = req.body || {};
-  for (const k of ['title', 'spec', 'projectId', 'branch', 'sessionId', 'columnId', 'assignee']) {
+  for (const k of ['title', 'spec', 'projectId', 'branch', 'sessionId', 'columnId', 'assignee', 'schedule']) {
     if (k in b) card[k] = b[k];
   }
   saveStore(store);
@@ -953,6 +971,46 @@ app.delete('/api/nucleos/:id/board/columns/:colId', auth, (req, res) => {
     saveStore(store);
     res.json({ ok: true });
   });
+});
+
+// ---- tarefas agendadas: minha agenda (tarefas vencidas pra mim, em todos os núcleos) ----
+app.get('/api/me/agenda', auth, (req, res) => {
+  const store = loadStore();
+  const me = canonicalAccountId(store, req.claims.sub);
+  const now = Date.now();
+  const due = [];
+  for (const id of Object.keys(store.nucleos)) {
+    if (!nucleoRoleFor(store, id, req.claims.sub)) continue;
+    const n = store.nucleos[id];
+    const board = (n.board && n.board.cards) ? n.board : null;
+    if (!board) continue;
+    for (const c of board.cards) {
+      const s = c.schedule;
+      if (!s || !s.next) continue;
+      if (canonicalAccountId(store, c.assignee || '') !== me) continue;
+      if (new Date(s.next).getTime() > now) continue;
+      due.push({ nucleoId: id, nucleoName: n.name, cardId: c.id, title: c.title, projectId: c.projectId, branch: c.branch, next: s.next, every: s.every || 0, unit: s.unit || 'month' });
+    }
+  }
+  res.json({ ok: true, due });
+});
+// concluir/ocorrência: recorrente avança p/ a próxima data; única encerra (vai p/ A fazer).
+app.post('/api/nucleos/:id/board/cards/:cardId/occurrence', auth, (req, res) => {
+  const store = loadStore();
+  const id = req.params.id;
+  if (!store.nucleos[id] || !nucleoRoleFor(store, id, req.claims.sub)) return res.status(403).json({ error: 'sem acesso' });
+  const board = ensureBoard(store.nucleos[id]);
+  const card = board.cards.find((c) => c.id === req.params.cardId);
+  if (!card || !card.schedule) return res.status(404).json({ error: 'tarefa agendada não encontrada' });
+  const s = card.schedule;
+  if (s.every && s.every > 0) {
+    s.next = nextOccurrence(s.next, s.every, s.unit || 'month');
+  } else {
+    card.schedule = null; // única: deixa de ser agendada
+    card.columnId = board.columns.some((c) => c.id === 'todo') ? 'todo' : (board.columns[1] && board.columns[1].id) || card.columnId;
+  }
+  saveStore(store);
+  res.json({ ok: true, card });
 });
 
 // pipelines (gestor) — CRUD simples
